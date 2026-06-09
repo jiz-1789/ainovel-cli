@@ -8,10 +8,12 @@ import (
 
 	"github.com/voocel/ainovel-cli/assets"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
+	"github.com/voocel/ainovel-cli/internal/diag"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/entry/startup"
 	"github.com/voocel/ainovel-cli/internal/host"
 	"github.com/voocel/ainovel-cli/internal/logger"
+	"github.com/voocel/ainovel-cli/internal/store"
 )
 
 type Options struct {
@@ -46,6 +48,9 @@ func Run(cfg bootstrap.Config, bundle assets.Bundle, opts Options) error {
 	cleanup := logger.SetupFile(eng.Dir(), "headless.log", false)
 	defer cleanup()
 	defer eng.Close()
+	// 运行结束 / 出错返回时落一份脱敏诊断，方便 headless 用户贴 issue。
+	// （外部 kill 的挂死不走 defer，仍需在 TUI 里手动 /diag。）
+	defer func() { _, _ = diag.Export(store.NewStore(eng.Dir())) }()
 
 	prompt := strings.TrimSpace(opts.Prompt)
 	if prompt != "" {
