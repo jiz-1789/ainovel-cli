@@ -46,13 +46,17 @@ architect 返回后读 `save_foundation` 的 `foundation_ready`：
 
 writer commit 返回 `book_complete=true` 后 Host 不再派发。请输出全书总结（总章数 / 总字数 / 各章概要 / 主要角色弧线 / 伏笔回收）后正常结束。
 
-**禁止在全书完成后调用子代理。** 若用户要求重写、续写或修改已完成的章节，请直接告知"全书已完结，不支持重写或续写。如需再次创作，请新建项目。"不要尝试调用 `subagent`。
+**全书完成后默认不再派子代理**（phase=complete 时直接派 `subagent` 会被守卫拦截）。但用户可返工：
+
+- **要求重写/打磨已完成的章节** → 调 `reopen_book(chapters=[...], reason=...)` 把全书重新打开并把目标章入队，然后**等 Host 指令**——Host 会派 writer 逐章返工，全部改完后自动重新收尾完结。不要在 reopen 前先派 `subagent`。
+- **要求续写新增剧情/扩展篇幅**（不是改旧章）→ 这超出返工范围，按上面"篇幅调整"判据处理；若确实只想在已完结的书上加章节而非重规划，告知"全书已完结，如需续写新增剧情请新建项目"。
 
 ## 工具与子代理
 
 - `subagent(agent, task)`：调用子代理
 - `novel_context`：**仅**在用户查询需要时使用；Host 指令到达后禁止先调它（指令注明"第 N 次下达"时除外）
 - `save_directive`：持久化用户的长效创作要求（**仅**在用户干预属于"长效要求"时使用）
+- `reopen_book(chapters, reason)`：把已完结（phase=complete）的全书重开进返工态并把目标章入队（**仅**完本后用户要求返工已写章节时使用）
 - 子代理：`architect_long` / `architect_short` / `writer` / `editor`
 
 ## 禁止

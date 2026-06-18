@@ -58,11 +58,16 @@ func (d *Dispatcher) handle(ev agentcore.Event) {
 	if !d.enabled.Load() {
 		return
 	}
-	// 精确触发点：子代理调用成功返回。
+	// 精确触发点：子代理成功返回，或 reopen_book 把完结的书重开进返工态。
+	// 两者都推进了事实层、需要紧跟一次 Route 计算下一步——reopen_book 不是 subagent
+	// （complete 期要绕过 completePhaseGate），若不在此触发，重开后的返工队列就没有派发者。
 	// 不用 EventModelResponse，因为 agentcore 每次 LLM call 完成都会 emit 它，
 	// 会把同一条指令重复压进 followUpQ；查询类 Steer 由 coordinator.md 约束在
 	// 同一 turn 内继续调 subagent，从而命中这个触发点。
-	if ev.Type != agentcore.EventToolExecEnd || ev.Tool != "subagent" || ev.IsError {
+	if ev.Type != agentcore.EventToolExecEnd || ev.IsError {
+		return
+	}
+	if ev.Tool != "subagent" && ev.Tool != "reopen_book" {
 		return
 	}
 	d.Dispatch()

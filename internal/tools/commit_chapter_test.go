@@ -182,6 +182,161 @@ func TestCommitChapterUpdatesCastLedger(t *testing.T) {
 // TestCommitChapterRejectsPolishWithoutDraftChange 验证：已完成章节进入打磨/重写队列后，
 // 若 writer 跳过 draft_chapter 直接 commit（drafts 与 chapters 内容完全相同），
 // commit_chapter 必须拒绝，强制 writer 先调 draft_chapter 写入新版本。
+// TestCommitChapterNonLayeredRecompletesAfterRework 验证非分层书完本后经 reopen 返工，
+// 改完章节 commit、队列排空时能自动重新回到 complete（补 drain 后判完结的非分层分支）。
+func TestCommitChapterNonLayeredRecompletesAfterRework(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 2); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+
+	// 两章写完并完结。第 2 章备齐 drafts/chapters，供返工提交。
+	ch2 := "第二章原始正文，用于模拟已提交终稿。"
+	if err := s.Drafts.SaveDraft(2, ch2); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	if err := s.Drafts.SaveFinalChapter(2, ch2); err != nil {
+		t.Fatalf("SaveFinalChapter: %v", err)
+	}
+	if err := s.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatalf("MarkChapterComplete(1): %v", err)
+	}
+	if err := s.Progress.MarkChapterComplete(2, len([]rune(ch2)), "", ""); err != nil {
+		t.Fatalf("MarkChapterComplete(2): %v", err)
+	}
+	if err := s.Progress.MarkComplete(); err != nil {
+		t.Fatalf("MarkComplete: %v", err)
+	}
+
+	// reopen 第 2 章 → phase 回 writing、PendingRewrites=[2]、flow=rewriting
+	if err := s.Progress.Reopen([]int{2}, "返工"); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+
+	// 返工提交（草稿需与终稿不同才放行）
+	if err := s.Drafts.SaveDraft(2, ch2+"\n\n返工新增段落。"); err != nil {
+		t.Fatalf("SaveDraft (reworked): %v", err)
+	}
+	tool := NewCommitChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter":    2,
+		"summary":    "返工后摘要",
+		"characters": []string{"主角"},
+		"key_events": []string{"清理"},
+	})
+	raw, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute rework commit: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if payload["book_complete"] != true {
+		t.Errorf("book_complete = %v, want true", payload["book_complete"])
+	}
+
+	p, _ := s.Progress.Load()
+	if p.Phase != domain.PhaseComplete {
+		t.Errorf("phase = %s, want complete (应自动重新收尾)", p.Phase)
+	}
+	if len(p.PendingRewrites) != 0 {
+		t.Errorf("PendingRewrites = %v, want empty", p.PendingRewrites)
+	}
+}
+
+// TestCommitChapterLayeredReopenRecompletesDespiteOpenThread 验证收口：分层书经 reopen
+// 返工后，即便 compass 仍有未收束长线（返工可能扰动），排空后也按"结构完整"重新完结——
+// 不卡在 writing，杜绝终卷末越界续写死循环（§6.5 / known_outline_exhaustion 家族）。
+// 反证：若 reopen 路径仍用质量级 layeredBookComplete，本例 open thread 会让其返 false、
+// book_complete 为假，测试即失败。
+func TestCommitChapterLayeredReopenRecompletesDespiteOpenThread(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 0); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+
+	// 单卷单弧两章，全部展开
+	foundation := NewSaveFoundationTool(s)
+	layeredArgs, _ := json.Marshal(map[string]any{
+		"type": "layered_outline",
+		"content": []map[string]any{{
+			"index": 1, "title": "卷一", "theme": "主题",
+			"arcs": []map[string]any{{
+				"index": 1, "title": "弧一", "goal": "目标",
+				"chapters": []map[string]any{
+					{"title": "首章", "core_event": "起", "hook": "续"},
+					{"title": "次章", "core_event": "承", "hook": "终"},
+				},
+			}},
+		}},
+		"scale": "long",
+	})
+	if _, err := foundation.Execute(context.Background(), layeredArgs); err != nil {
+		t.Fatalf("Execute layered: %v", err)
+	}
+
+	// 两章写完落盘并完结
+	ch2 := "第二章原始正文，模拟已提交终稿。"
+	for ch, body := range map[int]string{1: "第一章正文。", 2: ch2} {
+		if err := s.Drafts.SaveDraft(ch, body); err != nil {
+			t.Fatalf("SaveDraft %d: %v", ch, err)
+		}
+		if err := s.Drafts.SaveFinalChapter(ch, body); err != nil {
+			t.Fatalf("SaveFinalChapter %d: %v", ch, err)
+		}
+		if err := s.Progress.MarkChapterComplete(ch, len([]rune(body)), "", ""); err != nil {
+			t.Fatalf("MarkChapterComplete %d: %v", ch, err)
+		}
+	}
+	if err := s.Progress.MarkComplete(); err != nil {
+		t.Fatalf("MarkComplete: %v", err)
+	}
+
+	// 模拟"返工扰动了长线"：compass 仍有未收束的 open thread
+	if err := s.Outline.SaveCompass(domain.StoryCompass{EndingDirection: "主角归乡", OpenThreads: []string{"宿敌未除"}}); err != nil {
+		t.Fatalf("SaveCompass: %v", err)
+	}
+
+	// reopen 第 2 章 → 返工提交（草稿需与终稿不同才放行）
+	if err := s.Progress.Reopen([]int{2}, "返工"); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	if err := s.Drafts.SaveDraft(2, ch2+"\n\n返工新增段落。"); err != nil {
+		t.Fatalf("SaveDraft reworked: %v", err)
+	}
+	tool := NewCommitChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 2, "summary": "返工摘要", "characters": []string{"主角"}, "key_events": []string{"清理"},
+	})
+	raw, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute rework commit: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if bc, _ := out["book_complete"].(bool); !bc {
+		t.Error("reopen 返工排空后应按结构完整重新完结（即便长线未收束）")
+	}
+	p, _ := s.Progress.Load()
+	if p.Phase != domain.PhaseComplete {
+		t.Errorf("phase = %s, want complete", p.Phase)
+	}
+	if p.ReopenedFromComplete {
+		t.Error("重新完结后 ReopenedFromComplete 应被清除")
+	}
+}
+
 func TestCommitChapterRejectsPolishWithoutDraftChange(t *testing.T) {
 	dir := t.TempDir()
 	s := store.NewStore(dir)

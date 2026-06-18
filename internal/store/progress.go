@@ -196,9 +196,48 @@ func (s *ProgressStore) MarkChapterComplete(chapter, wordCount int, hookType, do
 	})
 }
 
-// MarkComplete 标记全书创作完成。
+// MarkComplete 标记全书创作完成，并清除重开返工标记（完结即不再处于返工态）。
 func (s *ProgressStore) MarkComplete() error {
-	return s.UpdatePhase(domain.PhaseComplete)
+	return s.io.WithWriteLock(func() error {
+		p, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if p == nil {
+			p = &domain.Progress{}
+		}
+		if err := domain.ValidatePhaseTransition(p.Phase, domain.PhaseComplete); err != nil {
+			return err
+		}
+		p.Phase = domain.PhaseComplete
+		p.ReopenedFromComplete = false
+		return s.saveUnlocked(p)
+	})
+}
+
+// Reopen 把已完结的书重新打开进入返工态：phase complete→writing + 目标章入队 + flow=rewriting，
+// 在一次写锁内原子完成。这是 phaseOrder“只前进”约束的唯一豁免出口——故意不走
+// ValidatePhaseTransition；回退的合法性收敛在本方法、且受 phase=complete 前置守卫保护，
+// 避免误用导致状态机失控。改完队列后 commit_chapter 会自动重新收尾完结。
+func (s *ProgressStore) Reopen(chapters []int, reason string) error {
+	return s.io.WithWriteLock(func() error {
+		p, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if p == nil {
+			return fmt.Errorf("progress 未初始化: %w", errs.ErrToolPrecondition)
+		}
+		if p.Phase != domain.PhaseComplete {
+			return fmt.Errorf("reopen 仅适用于已完结的书（当前 phase=%s）: %w", p.Phase, errs.ErrToolPrecondition)
+		}
+		p.Phase = domain.PhaseWriting // 唯一合法回退，受上面 complete 前置约束保护
+		p.PendingRewrites = chapters
+		p.RewriteReason = reason
+		p.Flow = domain.FlowRewriting
+		p.ReopenedFromComplete = true // 排空后按结构完整重新完结，见 commit_chapter drain 块
+		return s.saveUnlocked(p)
+	})
 }
 
 // ClearInProgress 清除进度中间状态。

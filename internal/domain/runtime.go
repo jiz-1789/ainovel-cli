@@ -53,6 +53,10 @@ type Progress struct {
 	CurrentVolume int  `json:"current_volume,omitempty"`
 	CurrentArc    int  `json:"current_arc,omitempty"`
 	Layered       bool `json:"layered,omitempty"`
+	// ReopenedFromComplete 标记本书是经 reopen 从完结态重开进入返工的。返工只改已有章、
+	// 不增减结构，故排空后应按"结构完整即重新完结"放行（避免终卷末伏笔被返工扰动后卡在
+	// writing → 越界续写死循环）；正向写作不置此标记，完结判定保持线索收束的保守语义。
+	ReopenedFromComplete bool `json:"reopened_from_complete,omitempty"`
 }
 
 // IsResumable 判断是否可以从断点恢复。

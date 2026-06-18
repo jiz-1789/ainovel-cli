@@ -312,6 +312,13 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 			return m, continueRuntime(m.runtime, text)
 		}
 		return m, steerRuntime(m.runtime, text)
+	case modeDone:
+		// 完结后用户输入（返工/续写诉求）：唤醒新一轮 run。Continue 在停机态走 Inject
+		// 自动恢复，Coordinator 收到 [用户干预] 后按 coordinator.md 路由——要求返工已写章
+		// 则调 reopen_book 把书重开进返工态。切回 modeRunning 重入工作台；本轮跑完
+		// doneMsg(complete) 会再置 modeDone。斜杠命令已在上面提前处理，不经此分支。
+		m.mode = modeRunning
+		return m, continueRuntime(m.runtime, text)
 	default:
 		return m, nil
 	}
@@ -449,9 +456,10 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		if msg.complete {
 			m.abortPending = false
 			m.mode = modeDone
-			// 完成态不锁输入框：仅停止自动续写（handleEnter 在 modeDone 落到空操作），
-			// 但 /export、/model 等命令仍需可用，输入框必须保持聚焦（issue #27）。
-			m.textarea.Placeholder = "创作已完成 · 可 /export 导出，或输入 / 查看命令"
+			// 完成态不锁输入框：停止自动续写，但用户仍可输入返工要求（modeDone 输入经
+			// Continue 唤醒新一轮 run，Coordinator 路由到 reopen_book），/export、/model
+			// 等命令也需可用，输入框必须保持聚焦（issue #27、#38）。
+			m.textarea.Placeholder = "创作已完成 · 可输入返工要求(如\"重写第3章\")、/export 导出，或输入 / 看命令"
 			return m, tea.Batch(fetchSnapshot(m.runtime), listenDone(m.runtime), m.textarea.Focus()), true
 		}
 		if m.abortPending {

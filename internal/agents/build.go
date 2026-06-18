@@ -260,7 +260,7 @@ func BuildCoordinator(
 	agent := agentcore.NewAgent(
 		agentcore.WithModel(coordinatorModel),
 		agentcore.WithSystemPrompt(bundle.Prompts.Coordinator),
-		agentcore.WithTools(subagentTool, contextTool, tools.NewSaveDirectiveTool(store)),
+		agentcore.WithTools(subagentTool, contextTool, tools.NewSaveDirectiveTool(store), tools.NewReopenBookTool(store)),
 		agentcore.WithMaxTurns(100_000),
 		agentcore.WithOnMessage(coordinatorOnMessage),
 		agentcore.WithToolsAreIdempotent(true),
@@ -288,7 +288,7 @@ func completePhaseGate(st *store.Store) agentcore.ToolGate {
 		if progress != nil && progress.Phase == domain.PhaseComplete {
 			return &agentcore.GateDecision{
 				Allowed: false,
-				Reason:  "全书已完成（phase=complete），无法再调用子代理。请告知用户全书已完结，不支持重写或续写。",
+				Reason:  "全书已完成（phase=complete），不能直接派子代理。若用户要返工已写章节，请先调用 reopen_book(chapters=[...]) 把书重新打开进入返工态（之后会自动派 writer 重写）；若用户要新增剧情，告知需新建项目。",
 			}, nil
 		}
 		return nil, nil

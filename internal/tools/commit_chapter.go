@@ -430,14 +430,28 @@ func (t *CommitChapterTool) executeRewriteCommit(
 	}
 	drained := len(remaining) == 0
 
-	// 队列清空后再判完结：分层长篇若"最后一章恰好走返工路径"，完结只能在此触发
-	// （主路径 applyCompletion 不经过 rewrite 提交）——补上旧模型这处时序缺口。
+	// 队列清空后再判完结：返工提交不经过主路径 applyCompletion，完结只能在此触发。
+	//   - 分层 + 正向写作：用质量级 layeredBookComplete（要求线索收束），未满足让位架构师。
+	//   - 分层 + reopen 返工（ReopenedFromComplete）：返工只改已有章、不增减结构，按结构完整
+	//     即重新完结——若因返工扰动了某条线索就卡在 writing，终卷末会落到越界续写死循环。
+	//   - 非分层：写满 TotalChapters 即完结（返工不增减章数，原本就满）。
 	bookComplete := false
-	if drained && latest != nil && latest.Layered && t.layeredBookComplete(latest) {
-		if cerr := t.store.Progress.MarkComplete(); cerr == nil {
-			bookComplete = true
-			if p, _ := t.store.Progress.Load(); p != nil {
-				flow = string(p.Flow)
+	if drained && latest != nil {
+		reComplete := false
+		switch {
+		case latest.Layered && latest.ReopenedFromComplete:
+			reComplete = t.layeredStructurallyComplete(latest)
+		case latest.Layered:
+			reComplete = t.layeredBookComplete(latest)
+		default:
+			reComplete = latest.TotalChapters > 0 && len(latest.CompletedChapters) >= latest.TotalChapters
+		}
+		if reComplete {
+			if cerr := t.store.Progress.MarkComplete(); cerr == nil {
+				bookComplete = true
+				if p, _ := t.store.Progress.Load(); p != nil {
+					flow = string(p.Flow)
+				}
 			}
 		}
 	}
@@ -542,10 +556,10 @@ func (t *CommitChapterTool) applyCompletion(result *domain.CommitResult, progres
 	return false
 }
 
-// layeredBookComplete 用客观事实判断分层长篇是否真正写完，对照 architect-long.md 完结判定
-// 清单里可量化的几项 + 结构性事实。全部满足才算完结；任一不满足都让位给架构师继续
-// expand_arc / append_volume，绝不抢在故事没写完时收尾。无 compass 时保守判为未完结。
-func (t *CommitChapterTool) layeredBookComplete(progress *domain.Progress) bool {
+// layeredStructurallyComplete 判定分层长篇是否"结构上写完"：返工队列空 + 无骨架弧待展开
+// + 所有已展开章节都已写。这是确定性的终态事实，不含伏笔/长线等语义判断——用作"防终态
+// 死循环"的安全网（返工排空后据此重新完结）。
+func (t *CommitChapterTool) layeredStructurallyComplete(progress *domain.Progress) bool {
 	// 1. 返工队列必须清空
 	if len(progress.PendingRewrites) > 0 {
 		return false
@@ -564,7 +578,15 @@ func (t *CommitChapterTool) layeredBookComplete(progress *domain.Progress) bool 
 	}
 	// 3. 已展开章节必须全部写完
 	expanded := len(domain.FlattenOutline(volumes))
-	if expanded == 0 || len(progress.CompletedChapters) < expanded {
+	return expanded > 0 && len(progress.CompletedChapters) >= expanded
+}
+
+// layeredBookComplete 用客观事实判断分层长篇是否真正写完，对照 architect-long.md 完结判定
+// 清单里可量化的几项 + 结构性事实。结构完整之上再要求伏笔归零、长线收束——任一不满足都
+// 让位给架构师继续 expand_arc / append_volume，绝不抢在故事没写完时收尾。无 compass 时保守
+// 判为未完结。这是正向写作的"质量级"完结判定，比 layeredStructurallyComplete 更严。
+func (t *CommitChapterTool) layeredBookComplete(progress *domain.Progress) bool {
+	if !t.layeredStructurallyComplete(progress) {
 		return false
 	}
 	// 4. 活跃伏笔必须归零（承诺已兑现）
