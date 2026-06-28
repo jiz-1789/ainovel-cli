@@ -48,6 +48,67 @@ func testObserver(events *[]Event) *observer {
 		streamExtractors:    make(map[string]*agentExtractor),
 		streamArgPrefixes:   make(map[string]string),
 		streamArgLabels:     make(map[string]string),
+		retryEvents:         make(map[string]string),
+	}
+}
+
+func TestObserverRetryEventsUpdateSameLine(t *testing.T) {
+	var events []Event
+	o := testObserver(&events)
+
+	o.handle(agentcore.Event{
+		Type: agentcore.EventRetry,
+		RetryInfo: &agentcore.RetryInfo{
+			Attempt:    1,
+			MaxRetries: 7,
+			Err:        errors.New("server 500"),
+		},
+	})
+	o.handle(agentcore.Event{
+		Type: agentcore.EventRetry,
+		RetryInfo: &agentcore.RetryInfo{
+			Attempt:    2,
+			MaxRetries: 7,
+			Err:        errors.New("server 500 again"),
+		},
+	})
+
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2 raw update events", len(events))
+	}
+	if events[0].ID == "" || events[1].ID != events[0].ID {
+		t.Fatalf("retry events should share ID for TUI in-place update: %+v", events)
+	}
+	if !strings.Contains(events[1].Summary, "重试 (2/7)") {
+		t.Fatalf("summary = %q, want updated retry count", events[1].Summary)
+	}
+}
+
+func TestObserverSubagentRetryEventsUpdateSameLinePerAgent(t *testing.T) {
+	var events []Event
+	o := testObserver(&events)
+
+	for i := 1; i <= 2; i++ {
+		o.handleToolUpdate(agentcore.Event{
+			Type: agentcore.EventToolExecUpdate,
+			Progress: &agentcore.ProgressPayload{
+				Kind:       agentcore.ProgressRetry,
+				Agent:      "writer",
+				Attempt:    i,
+				MaxRetries: 7,
+				Message:    "stream failed",
+			},
+		})
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2 raw update events", len(events))
+	}
+	if events[0].ID == "" || events[1].ID != events[0].ID {
+		t.Fatalf("writer retry events should share ID: %+v", events)
+	}
+	if events[1].Agent != "writer" || !strings.Contains(events[1].Summary, "重试 (2/7)") {
+		t.Fatalf("event = %+v, want writer retry 2/7", events[1])
 	}
 }
 

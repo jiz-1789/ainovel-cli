@@ -73,6 +73,7 @@ type observer struct {
 	streamExtractors      map[string]*agentExtractor // agent → 当前工具调用 JSON 参数的内容抽取器
 	streamArgPrefixes     map[string]string          // agent/tool → 参数流前缀，用于提前识别轻量标签
 	streamArgLabels       map[string]string          // agent/tool → 已从参数流提前识别出的展示名
+	retryEvents           map[string]string          // retry scope → event ID，用同一行原地更新 (2/7)
 	streamHasContent      bool                       // 当前 streamRound 是否已输出过内容（判断是否需要段落分隔）
 	streamLastByte        byte                       // 最近一次流式输出的末字节（用于精确补齐换行）
 }
@@ -108,6 +109,7 @@ func newObserver(coordinator *agentcore.Agent, s *storepkg.Store, emitEv func(Ev
 		streamExtractors:    make(map[string]*agentExtractor),
 		streamArgPrefixes:   make(map[string]string),
 		streamArgLabels:     make(map[string]string),
+		retryEvents:         make(map[string]string),
 	}
 	o.unsub = coordinator.Subscribe(o.handle)
 	return o
@@ -125,6 +127,19 @@ func (o *observer) finalize() {
 // setAborting 由 Host 在 Abort/Close/Start 等生命周期切换处调用，控制
 // "context canceled" 类衍生事件是否需要抑制（避免与"用户手动暂停"重复）。
 func (o *observer) setAborting(v bool) { o.aborting.Store(v) }
+
+func (o *observer) retryEventID(scope string, attempt int) string {
+	if strings.TrimSpace(scope) == "" {
+		scope = "coordinator"
+	}
+	if o.retryEvents == nil {
+		o.retryEvents = make(map[string]string)
+	}
+	if attempt <= 1 || o.retryEvents[scope] == "" {
+		o.retryEvents[scope] = nextEventID()
+	}
+	return o.retryEvents[scope]
+}
 
 // isCancellationNoise 判断一个错误是否为 abort 引发的衍生噪声。
 // 仅当 Host 处于 aborting 态时返回 true 才有意义——非 abort 期间的
@@ -191,6 +206,7 @@ func (o *observer) handle(ev agentcore.Event) {
 			}
 			prefix := fmt.Sprintf("重试 (%d/%d): ", ev.RetryInfo.Attempt, ev.RetryInfo.MaxRetries)
 			retryEv := Event{
+				ID:       o.retryEventID("coordinator", ev.RetryInfo.Attempt),
 				Time:     time.Now(),
 				Category: "SYSTEM",
 				Summary:  prefix + truncate(msg, 80),
@@ -376,6 +392,7 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 	case agentcore.ProgressRetry:
 		prefix := fmt.Sprintf("重试 (%d/%d): ", ev.Progress.Attempt, ev.Progress.MaxRetries)
 		retryEv := Event{
+			ID:       o.retryEventID(ev.Progress.Agent, ev.Progress.Attempt),
 			Time:     time.Now(),
 			Category: "SYSTEM",
 			Agent:    ev.Progress.Agent,

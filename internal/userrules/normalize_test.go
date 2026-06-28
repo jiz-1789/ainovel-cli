@@ -1,8 +1,11 @@
 package userrules
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+
+	"github.com/voocel/agentcore"
 )
 
 func TestExtractJSON_StripsCodeFences(t *testing.T) {
@@ -96,5 +99,101 @@ func TestNormalize_NilModelDegrades(t *testing.T) {
 	}
 	if cand.Structured.ChapterWords != nil {
 		t.Fatal("降级不应产出 structured")
+	}
+}
+
+// scriptedModel 是最小 fake ChatModel：按调用次序吐预设回复，并记录最后一轮收到的
+// messages，供断言反馈式重试是否把纠正提示并入了下一轮对话。回复用尽后重复最后一条。
+type scriptedModel struct {
+	replies  []string
+	calls    int
+	lastMsgs []agentcore.Message
+	lastCfg  agentcore.CallConfig
+}
+
+func (m *scriptedModel) Generate(_ context.Context, messages []agentcore.Message, _ []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+	var cfg agentcore.CallConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+	m.lastCfg = cfg
+	m.lastMsgs = messages
+	i := m.calls
+	m.calls++
+	if i >= len(m.replies) {
+		i = len(m.replies) - 1
+	}
+	return &agentcore.LLMResponse{Message: agentcore.Message{
+		Role:    agentcore.RoleAssistant,
+		Content: []agentcore.ContentBlock{agentcore.TextBlock(m.replies[i])},
+	}}, nil
+}
+
+func (m *scriptedModel) GenerateStream(context.Context, []agentcore.Message, []agentcore.ToolSpec, ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error) {
+	return nil, nil
+}
+
+func (m *scriptedModel) SupportsTools() bool { return false }
+
+// 反馈式重试：首轮吐坏 JSON、次轮才合法。Normalize 应成功，且次轮对话里带上了上一轮的
+// 坏输出与纠正提示（反馈式，而非原样盲重试）。
+func TestNormalize_FeedbackRetryRecovers(t *testing.T) {
+	model := &scriptedModel{replies: []string{
+		"这不是 JSON",
+		`{"structured":{"chapter_words":{"min":1200,"max":1600}},"preferences":"","uncertain":[]}`,
+	}}
+	n := NewNormalizer(model)
+
+	cand := n.Normalize(t.Context(), "startup_prompt", "每章1200到1600字")
+	if cand.Degraded {
+		t.Fatal("次轮已返回合法 JSON，不应降级")
+	}
+	if cand.Structured.ChapterWords == nil || cand.Structured.ChapterWords.Min != 1200 {
+		t.Fatalf("应解析出 chapter_words，got %+v", cand.Structured)
+	}
+	if model.calls != 2 {
+		t.Fatalf("应在第 2 次成功，实际调用 %d 次", model.calls)
+	}
+
+	var sawBad, sawHint bool
+	for _, msg := range model.lastMsgs {
+		switch msg.TextContent() {
+		case "这不是 JSON":
+			sawBad = true
+		case normalizerRetryHint:
+			sawHint = true
+		}
+	}
+	if !sawBad || !sawHint {
+		t.Errorf("次轮应并入上一轮坏输出与纠正提示，sawBad=%v sawHint=%v", sawBad, sawHint)
+	}
+}
+
+// 归一化是机械抽取：对支持关闭思考的模型应显式关思考，并把 max_tokens 留足给 JSON。
+// scriptedModel 未实现 CapabilityProvider → 思考策略默认允许 off → 应 Resolve 成 off。
+func TestNormalize_DisablesThinkingAndReservesTokens(t *testing.T) {
+	model := &scriptedModel{replies: []string{`{"preferences":"x"}`}}
+	n := NewNormalizer(model)
+
+	_ = n.Normalize(t.Context(), "startup_prompt", "随便一条规则")
+	if model.lastCfg.ThinkingLevel != agentcore.ThinkingOff {
+		t.Errorf("应对可关闭思考的模型关思考，got %q", model.lastCfg.ThinkingLevel)
+	}
+	if model.lastCfg.MaxTokens != normalizeMaxTokens {
+		t.Errorf("max_tokens 应为 %d，got %d", normalizeMaxTokens, model.lastCfg.MaxTokens)
+	}
+}
+
+// 全程坏 JSON：重试耗尽后降级，且恰好尝试 normalizeMaxAttempts 次。
+func TestNormalize_FeedbackRetryExhaustsThenDegrades(t *testing.T) {
+	model := &scriptedModel{replies: []string{"坏"}}
+	n := NewNormalizer(model)
+
+	cand := n.Normalize(t.Context(), "startup_prompt", "每章1200字")
+	if !cand.Degraded {
+		t.Fatal("全程坏 JSON 应降级")
+	}
+	if model.calls != normalizeMaxAttempts {
+		t.Fatalf("应尝试 %d 次，实际 %d", normalizeMaxAttempts, model.calls)
 	}
 }

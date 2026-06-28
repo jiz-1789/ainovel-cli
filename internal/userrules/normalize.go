@@ -15,25 +15,37 @@ import (
 	"strings"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/ainovel-cli/internal/rules"
 )
 
-// normalizeMaxTokens 单次归一化的输出上限。规则文本通常很短，2048 足够。
-const normalizeMaxTokens = 2048
+// normalizeMaxTokens 单次归一化的输出上限（思考 token 与 JSON 输出共享这一预算）。
+// 归一化 JSON 本身很小（通常 <1k），这里留大头是给"无法关闭思考的推理模型"的思考预算——
+// 留窄了思考会挤占 JSON 导致截断、解析失败。max_tokens 是上限不是计费量，调大不增成本。
+const normalizeMaxTokens = 8192
 
-// normalizeMaxAttempts 归一化总尝试次数（1 次重试后降级，不做无界重试，见设计 §失败与降级）。
-// LLM 输出有随机性，一次解析失败重试一次常能拿到合法 JSON；瞬时网络抖动同理。
-const normalizeMaxAttempts = 2
+// normalizeMaxAttempts 归一化总尝试次数（最多 2 次重试后降级，不做无界重试，见设计 §失败与降级）。
+// LLM 输出有随机性，解析失败再试常能拿到合法 JSON；瞬时网络抖动同理。
+const normalizeMaxAttempts = 3
 
 // Normalizer 把单个来源的自然语言规则归一化成 rules.Candidate（单次 LLM 调用）。
 type Normalizer struct {
-	model agentcore.ChatModel
+	model    agentcore.ChatModel
+	thinking agentcore.ThinkingLevel // 归一化是机械抽取，能关思考就关（见 NewNormalizer）
 }
 
 // NewNormalizer 用一个 ChatModel 构造归一化器。归一化是一次性启动工具，
 // 应传入能力较强的模型（如 ModelSet 的默认模型），不必跟随写作的弱模型。
+//
+// 归一化是机械抽取、不需要推理：能关思考就关（腾出 max_tokens 给 JSON、省 latency 与成本）。
+// 用模型自身的思考策略 Resolve(off)——支持关闭就关，不支持（o 系等总在思考的模型）则回落
+// ThinkingAuto（provider 默认），由 normalizeMaxTokens 的思考预算兜底避免截断。
 func NewNormalizer(model agentcore.ChatModel) *Normalizer {
-	return &Normalizer{model: model}
+	thinking := agentcore.ThinkingAuto
+	if model != nil {
+		thinking, _ = llm.ThinkingPolicyFor(model).Resolve(agentcore.ThinkingOff)
+	}
+	return &Normalizer{model: model, thinking: thinking}
 }
 
 // Normalize 归一化一个来源。永不返回 error——失败时返回 degraded Candidate
@@ -56,14 +68,17 @@ func (n *Normalizer) Normalize(ctx context.Context, source, text string) rules.C
 	// 快照只留 status=degraded + 来源标注（见设计 §失败与降级 / §回显）。
 	var lastErr string
 	for attempt := 1; attempt <= normalizeMaxAttempts; attempt++ {
-		resp, err := n.model.Generate(ctx, messages, nil, agentcore.WithMaxTokens(normalizeMaxTokens))
+		resp, err := n.model.Generate(ctx, messages, nil,
+			agentcore.WithThinking(n.thinking),
+			agentcore.WithMaxTokens(normalizeMaxTokens))
 		switch {
 		case err != nil:
 			lastErr = err.Error()
 		case resp == nil:
 			lastErr = "模型返回空响应"
 		default:
-			if out, ok := parseNormalizerJSON(resp.Message.TextContent()); ok {
+			raw := resp.Message.TextContent()
+			if out, ok := parseNormalizerJSON(raw); ok {
 				return rules.Candidate{
 					Source:      source,
 					Structured:  out.Structured,
@@ -72,6 +87,13 @@ func (n *Normalizer) Normalize(ctx context.Context, source, text string) rules.C
 				}
 			}
 			lastErr = "返回非合法 JSON"
+			// 反馈式重试：把上次的非法输出与纠正提示并入对话，让下一轮带着错误针对性
+			// 重出 JSON，而非原样盲重试。只对"格式坏"有意义——网络错误 / 空响应那两支
+			// 没有可反馈的上次输出，仍是盲重试。
+			messages = append(messages,
+				agentcore.Message{Role: agentcore.RoleAssistant, Content: []agentcore.ContentBlock{agentcore.TextBlock(raw)}},
+				agentcore.Message{Role: agentcore.RoleUser, Content: []agentcore.ContentBlock{agentcore.TextBlock(normalizerRetryHint)}},
+			)
 		}
 		slog.Warn("规则归一化失败",
 			"module", "rules", "source", source, "attempt", attempt, "err", lastErr)
@@ -215,3 +237,7 @@ structured 只允许以下字段(没有别的字段):
 
 preferences:自然语言风格/人物/审美偏好,一段可读文本。
 uncertain:你故意没提升到 structured 的项+原因(字符串数组)。`
+
+// normalizerRetryHint 在归一化输出无法解析为 JSON 时追加给模型，引导其针对性重出
+// （反馈式重试，见 Normalize 的"返回非合法 JSON"分支）。
+const normalizerRetryHint = "上面的回复无法解析为 JSON。请严格只输出一个 JSON 对象，含 structured / preferences / uncertain 三个字段，不要任何解释文字或代码围栏。"
